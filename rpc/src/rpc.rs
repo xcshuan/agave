@@ -24,7 +24,7 @@ use {
         accounts::AccountAddressFilter,
         accounts_index::{AccountIndex, AccountSecondaryIndexes, IndexKey, ScanConfig, ScanResult},
     },
-    solana_client::connection_cache::Protocol,
+    solana_client::{connection_cache::Protocol, rpc_request::NUM_TOP_HOLDER_TOKEN_ACCOUNTS},
     solana_entry::entry::Entry,
     solana_faucet::faucet::request_airdrop_transaction,
     solana_feature_set as feature_set,
@@ -2046,6 +2046,100 @@ impl JsonRpcRequestProcessor {
         Ok(new_response(&bank, supply))
     }
 
+    pub async fn get_token_holders_number(
+        &self,
+        mint: Pubkey,
+        commitment: Option<CommitmentConfig>,
+    ) -> Result<RpcResponse<u64>> {
+        let bank = self.bank(commitment);
+        let (mint_owner, data) = get_mint_owner_and_additional_data(&bank, &mint)?;
+        if !is_known_spl_token_id(&mint_owner) {
+            return Err(Error::invalid_params(
+                "Invalid param: not a Token mint".to_string(),
+            ));
+        }
+
+        let token_balances = self
+            .get_filtered_spl_token_accounts_by_mint(
+                Arc::clone(&bank),
+                mint_owner,
+                mint,
+                vec![],
+                true,
+            )
+            .await?;
+
+        token_balances
+            .iter()
+            .filter(|(_, account)| {
+                let amount = StateWithExtensions::<TokenAccount>::unpack(account.data())
+                    .map(|account| account.base.amount)
+                    .unwrap_or(0);
+
+                amount > 0
+            })
+            .count();
+
+        Ok(new_response(&bank, token_balances.len() as u64))
+    }
+
+    pub async fn get_token_top_holders(
+        &self,
+        mint: Pubkey,
+        commitment: Option<CommitmentConfig>,
+    ) -> Result<RpcResponse<Vec<RpcTokenAccountHolder>>> {
+        let bank = self.bank(commitment);
+        let (mint_owner, data) = get_mint_owner_and_additional_data(&bank, &mint)?;
+        if !is_known_spl_token_id(&mint_owner) {
+            return Err(Error::invalid_params(
+                "Invalid param: not a Token mint".to_string(),
+            ));
+        }
+
+        let mut token_holders = BinaryHeap::<Reverse<(u64, Pubkey, Pubkey)>>::with_capacity(
+            NUM_TOP_HOLDER_TOKEN_ACCOUNTS,
+        );
+        for (address, account) in self
+            .get_filtered_spl_token_accounts_by_mint(
+                Arc::clone(&bank),
+                mint_owner,
+                mint,
+                vec![],
+                true,
+            )
+            .await?
+        {
+            let (amount, owner) = StateWithExtensions::<TokenAccount>::unpack(account.data())
+                .map(|account| (account.base.amount, account.base.owner))
+                .unwrap_or((0, Pubkey::default()));
+            let new_entry = (amount, owner, address);
+            if token_holders.len() >= NUM_TOP_HOLDER_TOKEN_ACCOUNTS {
+                let Reverse(entry) = token_holders
+                    .peek()
+                    .expect("BinaryHeap::peek should succeed when len > 0");
+                if *entry >= new_entry {
+                    continue;
+                }
+                token_holders.pop();
+            }
+            token_holders.push(Reverse(new_entry));
+        }
+
+        let token_holders = token_holders
+            .into_sorted_vec()
+            .into_iter()
+            .map(|Reverse((amount, owner, address))| {
+                Ok(RpcTokenAccountHolder {
+                    owner: owner.to_string(),
+                    address: address.to_string(),
+                    amount: token_amount_to_ui_amount_v2(amount, &data),
+                })
+            })
+            .collect::<Result<Vec<_>>>()?;
+
+        Ok(new_response(&bank, token_holders))
+    }
+
     pub async fn get_token_largest_accounts(
         &self,
         mint: Pubkey,
@@ -3325,6 +3419,23 @@ pub mod rpc_accounts_scan {
             config: Option<RpcProgramAccountsConfig>,
         ) -> BoxFuture<Result<OptionalContext<Vec<RpcKeyedAccount>>>>;
 
+
+        #[rpc(meta, name = "getTokenHoldersNumber")]
+        fn get_token_holders_number(
+            &self,
+            meta: Self::Metadata,
+            mint_str: String,
+            commitment: Option<CommitmentConfig>,
+        ) -> BoxFuture<Result<RpcResponse<u64>>>;
+
+        #[rpc(meta, name = "getTokenTopHolders")]
+        fn get_token_top_holders(
+            &self,
+            meta: Self::Metadata,
+            mint_str: String,
+            commitment: Option<CommitmentConfig>,
+        ) -> BoxFuture<Result<RpcResponse<Vec<RpcTokenAccountHolder>>>>;
+
         #[rpc(meta, name = "getLargestAccounts")]
         fn get_largest_accounts(
             &self,
@@ -3426,6 +3537,41 @@ pub mod rpc_accounts_scan {
         ) -> BoxFuture<Result<RpcResponse<RpcSupply>>> {
             debug!("get_supply rpc request received");
             async move { Ok(meta.get_supply(config).await?) }.boxed()
+        }
+
+
+        fn get_token_holders_number(
+            &self,
+            meta: Self::Metadata,
+            mint_str: String,
+            commitment: Option<CommitmentConfig>,
+        ) -> BoxFuture<Result<RpcResponse<u64>>> {
+            debug!(
+                "get_token_largest_accounts rpc request received: {:?}",
+                mint_str
+            );
+            async move {
+                let mint = verify_pubkey(&mint_str)?;
+                meta.get_token_holders_number(mint, commitment).await
+            }
+            .boxed()
+        }
+
+        fn get_token_top_holders(
+            &self,
+            meta: Self::Metadata,
+            mint_str: String,
+            commitment: Option<CommitmentConfig>,
+        ) -> BoxFuture<Result<RpcResponse<Vec<RpcTokenAccountHolder>>>> {
+            debug!(
+                "get_token_largest_accounts rpc request received: {:?}",
+                mint_str
+            );
+            async move {
+                let mint = verify_pubkey(&mint_str)?;
+                meta.get_token_top_holders(mint, commitment).await
+            }
+            .boxed()
         }
 
         fn get_token_largest_accounts(
